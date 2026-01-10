@@ -1,5 +1,5 @@
 import type { CustomComponents } from '../types';
-import type { Root } from 'hast';
+import type { Root, Element, ElementContent } from 'hast';
 
 import { mdxExpressionFromMarkdown } from 'mdast-util-mdx-expression';
 import { mdxExpression } from 'micromark-extension-mdx-expression';
@@ -10,6 +10,7 @@ import remarkGfm from 'remark-gfm';
 import remarkParse from 'remark-parse';
 import remarkRehype from 'remark-rehype';
 import { unified } from 'unified';
+import { SKIP, visit } from 'unist-util-visit';
 import { VFile } from 'vfile';
 
 import { rehypeMdxishComponents } from '../processor/plugin/mdxish-components';
@@ -43,6 +44,44 @@ export interface MdxishOpts {
 const defaultTransformers = [calloutTransformer, codeTabsTransformer, gemojiTransformer, embedTransformer];
 
 /**
+ * Rehype plugin that wraps custom components with TailwindRoot at the HAST level.
+ * This is a fallback for components that weren't wrapped at the MDAST level
+ * (e.g., when mdxishComponentBlocks couldn't convert them to mdxJsxFlowElement).
+ */
+const rehypeTailwindWrapper = (componentNames: Set<string>) => {
+  return (tree: Root) => {
+    visit(tree, 'element', (node: Element, index, parent: Element | Root) => {
+      if (index === undefined || !parent) return undefined;
+
+      // Check if this is a custom component (PascalCase tag name in our components set)
+      const tagName = node.tagName;
+      if (!componentNames.has(tagName)) return undefined;
+
+      // Check if already wrapped in TailwindRoot (parent is TailwindRoot)
+      if (parent.type === 'element' && (parent as Element).tagName === 'TailwindRoot') {
+        return undefined;
+      }
+
+      // Check if this node is already a TailwindRoot
+      if (tagName === 'TailwindRoot') return undefined;
+
+      // Wrap the component with TailwindRoot
+      const wrapper: Element = {
+        type: 'element',
+        tagName: 'TailwindRoot',
+        properties: { flow: true },
+        children: [node as ElementContent],
+      };
+
+      parent.children.splice(index, 1, wrapper as ElementContent);
+
+      // Skip visiting children of the wrapper to avoid double-wrapping nested components
+      return SKIP;
+    });
+  };
+};
+
+/**
  * Process markdown content with MDX syntax support.
  * Detects and renders custom component tags from the components hash.
  *
@@ -72,6 +111,9 @@ export function mdxish(mdContent: string, opts: MdxishOpts = {}): Root {
     return acc;
   }, {});
 
+  // Create set of component names for HAST-level tailwind wrapper
+  const componentNames = new Set(Object.keys(components));
+
   const processor = unified()
     .data('micromarkExtensions', [mdxExpression({ allowEmpty: true })]) // Parse inline JSX expressions as AST nodes for later evaluation
     .data('fromMarkdownExtensions', [mdxExpressionFromMarkdown()])
@@ -95,7 +137,10 @@ export function mdxish(mdContent: string, opts: MdxishOpts = {}): Root {
     .use(rehypeMdxishComponents, {
       components,
       processMarkdown: (markdown: string) => mdxish(markdown, opts),
-    });
+    })
+    // Fallback: wrap custom components with TailwindRoot at HAST level
+    // This catches components that weren't wrapped at MDAST level (e.g., complex nesting structures)
+    .use(useTailwind ? () => rehypeTailwindWrapper(componentNames) : undefined);
 
   const vfile = new VFile({ value: parserReadyContent });
   const hast = processor.runSync(processor.parse(parserReadyContent), vfile) as Root;
